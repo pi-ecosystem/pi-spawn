@@ -1,4 +1,4 @@
-# spawn — app-owned subagents
+# spawn — subagents for pi (pi-spawn)
 
 One primitive: **a pi session**. A subagent is a session whose parent is
 another session instead of the UI. Same verbs at every level:
