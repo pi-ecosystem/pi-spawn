@@ -1,10 +1,12 @@
-# spawn — subagents for pi (pi-spawn)
+# spawn — subagents + background processes for pi (pi-spawn)
 
-One primitive: **a pi session**. A subagent is a session whose parent is
-another session instead of the UI. Same verbs at every level:
-prompt / steer / followup / stop / status / transcript.
+Two primitives, one registry: **a pi session** (subagent) and **a shell
+process** (bg proc). A subagent is a session whose parent is another
+session instead of the UI. A bg proc is a shell command whose logs live
+in a file. Same verbs at every level for lifecycle:
+start / status / stop / list / delete.
 
-## Tool: `spawn`
+## Tool: `spawn_agent`
 
 Single tool, `action` param. Async-first: `start` always returns
 immediately with `{ id }`; completion wakes the parent via message.
@@ -21,6 +23,41 @@ immediately with `{ id }`; completion wakes the parent via message.
 
 Children are real `pi --mode rpc` subprocesses, driven over RPC.
 Unset `model`/`thinking`/`tools` inherit host defaults (same as parent).
+
+## Tool: `spawn_bg`
+
+Single tool, `action` param. A proc is a shell command, not a session:
+no steering, no transcript — stdout+stderr append to `output.log` and
+the parent reads it with its own tools. No `output` action by design.
+
+| action | params | result |
+|---|---|---|
+| `start` | `command`, `label?`, `cwd?` | `{ id, logFile }` immediately |
+| `status` | `id` | state, elapsed, exit code, log path (never content) |
+| `stop` | `id` | SIGTERM, SIGKILL after 5s grace, keeps log |
+| `list` | — | all bg procs this session |
+| `delete` | `id` | stops if running, removes log files, drops from list |
+
+Procs spawn detached (`bash -c`) with the full parent environment, so
+dev servers and watchers get what they need. Kills target the whole
+process group. Completion wakes the parent via `spawn-bg-done` with
+`details{id,label,status,exitCode,logFile,durationMs,command}` — id +
+exit + path only, never log bytes.
+
+## Slash
+
+- `/procs` — list bg procs (via `spawn-note`)
+- `/proc-stop <id>` — same as `stop`
+- `/proc-status <id>` — same as `status`
+- `/proc-delete <id>` — same as `delete`
+
+## Messages (additions for bg procs)
+
+| customType | display | content |
+|---|---|---|
+| `spawn-bg-started` | true | one line: label + id + log path; the proc's ONLY card |
+| `spawn-bg-done` | false | id + exit code + log path + `details{...logFile,exitCode}` — wakes parent, renders nothing new |
+| `spawn-bg-stopped` | false | one line: label + id + reason (same silent treatment) |
 
 ## Threads: one row per conversation
 

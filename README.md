@@ -23,12 +23,17 @@ pi install git:github.com/pi-ecosystem/pi-spawn   # or: pi install ./pi-spawn
 
 | Tool / command | What it does |
 |---|---|
-| `spawn` | `start` (async, returns `{id}`), `status`, `stop`, `steer`, `followup`, `list`, `delete` |
-| `/agents` | list spawned children with ids + states |
-| `/agent-stop <id>` | stop a child, keep its transcript |
-| `/agent-steer <id> <msg>` | redirect a live child |
-| `/agent-status <id>` | peek at a child |
+| `spawn_agent` | `start` (async, returns `{id}`), `status`, `stop`, `steer`, `followup`, `list`, `delete` |
+| `spawn_bg` | `start` (async, returns `{id, logFile}`), `status`, `stop`, `list`, `delete` |
+| `/agents` | list spawned subagents with ids + states |
+| `/agent-stop <id>` | stop a subagent, keep its transcript |
+| `/agent-steer <id> <msg>` | redirect a live subagent |
+| `/agent-status <id>` | peek at a subagent |
 | `/agent-delete <id>` | stop + remove transcript files |
+| `/procs` | list background processes with ids + states |
+| `/proc-stop <id>` | stop a process, keep its log |
+| `/proc-status <id>` | peek at a process |
+| `/proc-delete <id>` | stop + remove log files |
 
 Children are real `pi --mode rpc` subprocesses and inherit the host's
 model/thinking/tools unless overridden. See [SPAWN.md](./SPAWN.md) for the

@@ -24,7 +24,6 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const MAX_DEPTH = 3;
-const MAX_CHILDREN = 8;
 const CMD_TIMEOUT_MS = 30_000;
 const STOP_GRACE_MS = 5_000;
 
@@ -33,8 +32,14 @@ type ChildState = "running" | "done" | "stopped" | "failed";
 interface Child {
   id: string;
   thread: string;
+  kind: "agent" | "proc";
   label: string;
   task: string;
+  command?: string;
+  logFile?: string;
+  logStream?: fs.WriteStream;
+  exitCode?: number;
+  stopping?: string;
   proc: ChildProcess;
   state: ChildState;
   startedAt: number;
@@ -112,6 +117,12 @@ function fmtElapsed(c: Child): string {
 }
 
 function summary(c: Child): string {
+  if (c.kind === "proc") {
+    const exit = c.exitCode != null ? ` · exit ${c.exitCode}` : "";
+    const err = c.error ? ` — error: ${c.error.slice(0, 300)}` : "";
+    const log = c.logFile ? `\nLogs: ${c.logFile}` : "";
+    return `${c.id} [proc ${c.label}] ${c.state} · ${fmtElapsed(c)}${exit}${err}${log}`;
+  }
   const tail = c.finalText ? ` — ${c.finalText.slice(0, 200)}` : "";
   const err = c.error ? ` — error: ${c.error.slice(0, 300)}` : "";
   return `${c.id} [${c.label}] ${c.state} · ${fmtElapsed(c)}${tail}${err}`;
@@ -182,10 +193,6 @@ async function startChild(
   if (d >= MAX_DEPTH) {
     throw new Error(`spawn depth limit reached (${MAX_DEPTH}); refusing to nest deeper`);
   }
-  const live = [...children.values()].filter((c) => c.state === "running").length;
-  if (live >= MAX_CHILDREN) {
-    throw new Error(`spawn limit reached (${MAX_CHILDREN} live children); stop one first`);
-  }
   if (!opts.task?.trim()) throw new Error("spawn start requires a non-empty task");
 
   const cwd = opts.cwd || parentCwd;
@@ -236,7 +243,7 @@ async function startChild(
   });
 
   const c: Child = {
-    id, thread, label, task: opts.task, proc,
+    id, thread, kind: "agent", label, task: opts.task, proc,
     state: "running", startedAt: Date.now(),
     seq: 0, pending: new Map(), buf: "",
   };
@@ -333,6 +340,127 @@ async function finishChild(pi: ExtensionAPI, c: Child, state: ChildState, error?
       { triggerTurn: true },
     );
   } catch { /* parent gone; record keeps the result for status/list */ }
+}
+
+// --- background processes (spawn_bg) ----------------------------------------
+// A proc is a raw shell command, not a pi session: no RPC, no steering,
+// no transcript. Stdout+stderr append to output.log; the ONLY thing the
+// parent ever gets pushed is the id, the exit code, and the log path.
+// Reading the log is the parent's own job (read/grep/bash) — this tool
+// never parses, tails, filters, or rotates it.
+
+function killTree(c: Child, sig: NodeJS.Signals) {
+  const pid = c.proc.pid;
+  if (!pid) {
+    try { c.proc.kill(sig); } catch { /* already out */ }
+    return;
+  }
+  // Procs spawn detached, so the child is a process-group leader:
+  // a negative pid kills the whole tree (dev servers, watchers).
+  if (process.platform !== "win32") {
+    try { process.kill(-pid, sig); return; } catch { /* fall through */ }
+  }
+  try { c.proc.kill(sig); } catch { /* already out */ }
+}
+
+async function startProc(
+  pi: ExtensionAPI,
+  parentCwd: string,
+  opts: { command: string; label?: string; cwd?: string },
+): Promise<Child> {
+  if (!opts.command?.trim()) throw new Error("spawn_bg start requires a non-empty command");
+  const cwd = opts.cwd || parentCwd;
+  try {
+    fs.mkdirSync(cwd, { recursive: true });
+  } catch (e: any) {
+    throw new Error(`spawn_bg cwd unavailable (${cwd}): ${e.message ?? e}`);
+  }
+  const id = rid("proc");
+  const dir = path.join(spawnRoot(), id);
+  fs.mkdirSync(dir, { recursive: true });
+  const label = opts.label?.slice(0, 80) || opts.command.split(/\s+/).slice(0, 6).join(" ").slice(0, 48);
+  const logFile = path.join(dir, "output.log");
+  try {
+    fs.appendFileSync(logFile, `$ ${opts.command}\n# cwd: ${cwd} · started: ${new Date().toISOString()}\n`);
+  } catch (e: any) {
+    throw new Error(`spawn_bg log unavailable (${logFile}): ${e.message ?? e}`);
+  }
+  const logStream = fs.createWriteStream(logFile, { flags: "a" });
+  // Full environment inherit (same strategy as agents: everything,
+  // limit only on request). No PI_SESSION_* stripping — a dev server
+  // gets what it needs.
+  const proc = nodeSpawn("bash", ["-c", opts.command], {
+    cwd,
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env },
+  });
+  const c: Child = {
+    id, thread: id, kind: "proc", label, task: opts.command,
+    command: opts.command, logFile, logStream,
+    proc, state: "running", startedAt: Date.now(),
+    seq: 0, pending: new Map(), buf: "",
+  };
+  proc.stdout!.pipe(logStream, { end: false });
+  proc.stderr!.pipe(logStream, { end: false });
+  proc.on("exit", (code) => {
+    c.exitCode = code ?? undefined;
+    // A stop in progress owns the outcome: the TERM-induced exit must
+    // read "stopped", not "done".
+    if (c.stopping) void finishProc(pi, c, "stopped", c.stopping).catch(() => {});
+    else void finishProc(pi, c, "done").catch(() => {});
+  });
+  proc.on("error", (e: any) => {
+    void finishProc(pi, c, "failed", `spawn failed: ${e.message ?? e}`).catch(() => {});
+  });
+  children.set(id, c);
+  try {
+    pi.sendMessage({
+      customType: "spawn-bg-started",
+      content: `Started **${label}** (${id})\nLogs: ${logFile}`,
+      display: true,
+      details: { id, thread: id, kind: "proc", label, command: opts.command, logFile, startedAt: Date.now(), pid: proc.pid ?? undefined },
+    });
+  } catch { /* host without message channel; status still works */ }
+  return c;
+}
+
+async function finishProc(pi: ExtensionAPI, c: Child, state: ChildState, error?: string) {
+  if (c.state !== "running") return;
+  c.state = state;
+  c.endedAt = Date.now();
+  if (error) c.error = error;
+  try { c.logStream?.end(); } catch { /* ignore */ }
+  const type = state === "done" ? "spawn-bg-done" : "spawn-bg-stopped";
+  const exit = c.exitCode != null ? `exit ${c.exitCode}` : state;
+  // Deliberately content-free: id + exit + log path only. The parent
+  // reads the log itself; we never push log bytes into its context.
+  const body = `**${c.label}** (${c.id}) ${exit}${c.error ? `: ${c.error}` : ""}\nLogs: ${c.logFile}`;
+  try {
+    await pi.sendMessage(
+      {
+        customType: type,
+        content: body,
+        display: false,
+        details: { id: c.id, thread: c.thread, kind: "proc", label: c.label, status: state, exitCode: c.exitCode, logFile: c.logFile, durationMs: c.endedAt - c.startedAt, command: c.command },
+      },
+      { triggerTurn: true },
+    );
+  } catch { /* parent gone; record keeps the result for status/list */ }
+}
+
+async function stopProc(pi: ExtensionAPI, c: Child, reason = "stopped by parent"): Promise<Child> {
+  if (c.state !== "running") return c;
+  c.stopping = reason;
+  killTree(c, "SIGTERM");
+  await waitExit(c, STOP_GRACE_MS);
+  if (c.state === "running") {
+    killTree(c, "SIGKILL");
+    await waitExit(c, 3000);
+  }
+  // The exit handler normally settles this; this is the backstop.
+  await finishProc(pi, c, "stopped", reason);
+  return c;
 }
 
 // Resolve a run id, id prefix, or thread id to a live record.
@@ -455,6 +583,7 @@ async function stopChild(pi: ExtensionAPI, id: string, reason = "stopped by pare
   const c = children.get(id);
   if (!c) throw new Error(`'${noChild(id)}'`);
   if (c.state !== "running") return c;
+  if (c.kind === "proc") return stopProc(pi, c, reason);
   try {
     await sendCmd(c, { type: "abort" }, 10_000);
   } catch { /* fall through to kill */ }
@@ -484,8 +613,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   const tool = defineTool({
-    name: "spawn",
-    label: "Spawn",
+    name: "spawn_agent",
+    label: "Spawn Agent",
     description:
       "Run a subagent: a full pi session as a child of this session. start launches async and returns an id immediately (never blocks); completion wakes you with the result. continueFrom relaunches a finished child attached to a copy of its transcript (refuse while it is running — steer instead). status peeks, steer redirects the live run, followup queues for its next turn, stop ends it (transcript kept), delete stops it and removes its transcript files, list shows all children. Children inherit host defaults unless model/thinking/tools/cwd override them.",
     parameters: SpawnParams,
@@ -564,8 +693,8 @@ export default function (pi: ExtensionAPI) {
             }
           }
           case "list": {
-            const all = [...children.values()];
-            if (!all.length) return textResult("No spawned children this session.", { count: 0 });
+            const all = [...children.values()].filter((c) => c.kind !== "proc");
+            if (!all.length) return textResult("No spawned subagents this session.", { count: 0 });
             return textResult(
               all.map(summary).join("\n"),
               { count: all.length, children: all.map((c) => ({ id: c.id, label: c.label, status: c.state })) },
@@ -579,13 +708,94 @@ export default function (pi: ExtensionAPI) {
   });
   pi.registerTool(tool);
 
+  // --- background processes: spawn_bg --------------------------------------
+  // A proc is a shell command, not a session. start returns {id, logFile}
+  // immediately; stdout+stderr append to the log; completion wakes the
+  // parent with id + exit code + log path (never log bytes). The parent
+  // reads the log with its own tools. No output action by design.
+  const BgParams = Type.Object({
+    action: StringEnum(["start", "status", "stop", "list", "delete"] as const, {
+      description: "start: launch async (returns id + log path immediately). status/stop/delete take id. list: all background processes.",
+    }),
+    command: Type.Optional(Type.String({ description: "start: shell command to run (bash -c)" })),
+    id: Type.Optional(Type.String({ description: "proc id for status/stop/delete" })),
+    label: Type.Optional(Type.String({ description: "start: short label shown in UI" })),
+    cwd: Type.Optional(Type.String({ description: "start: working dir, else parent cwd" })),
+  });
+
+  const bgTool = defineTool({
+    name: "spawn_bg",
+    label: "Spawn BG",
+    description:
+      "Run a background process: a shell command as a child of this session. start launches async and returns an id plus a log file path immediately (never blocks, never streams output); stdout+stderr append to that file. Completion wakes you with the exit code and the log path — read the log with your own tools. status peeks (state + exit code + log path, never content), stop ends it (SIGTERM then SIGKILL, log kept), delete stops it and removes its log files, list shows all background processes.",
+    parameters: BgParams,
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const cwd = (ctx as any).cwd ?? process.cwd();
+      try {
+        switch (params.action) {
+          case "start": {
+            if (signal?.aborted) return errResult("spawn_bg aborted before start");
+            const c = await startProc(pi, cwd, {
+              command: params.command ?? "",
+              label: params.label,
+              cwd: params.cwd,
+            });
+            signal?.addEventListener("abort", () => {
+              void stopChild(pi, c.id, "parent aborted the spawn").catch(() => {});
+            });
+            return textResult(
+              `Started **${c.label}** (${c.id}). Logs: ${c.logFile}. Running async — completion will wake you with the exit code. Read the log with your own tools.`,
+              { id: c.id, logFile: c.logFile, label: c.label, status: c.state },
+            );
+          }
+          case "status": {
+            const c = resolveChild(params.id ?? "");
+            if (!c) return errResult(`'${noChild(params.id ?? "")}'`);
+            if (c.kind !== "proc") return errResult(`${c.id} is a subagent, not a background process; use spawn_agent status`);
+            return textResult(summary(c), { id: c.id, label: c.label, status: c.state, exitCode: c.exitCode, logFile: c.logFile });
+          }
+          case "stop": {
+            const c = resolveChild(params.id ?? "");
+            if (!c) return errResult(`'${noChild(params.id ?? "")}'`);
+            if (c.kind !== "proc") return errResult(`${c.id} is a subagent, not a background process; use spawn_agent stop`);
+            if (c.state !== "running") {
+              return textResult(`${c.id} [${c.label}] is already ${c.state}${c.exitCode != null ? ` (exit ${c.exitCode})` : ""}. Logs: ${c.logFile}`, { id: c.id, status: c.state });
+            }
+            await stopChild(pi, c.id);
+            return textResult(`Stopped ${c.id} [${c.label}]. Logs kept: ${c.logFile}`, { id: c.id, status: c.state });
+          }
+          case "delete": {
+            const key = params.id ?? "";
+            try {
+              const r = await deleteChild(pi, key);
+              return textResult(`Deleted ${r.id} [${r.label}]. Log files removed.`, { id: r.id, deleted: true });
+            } catch (e: any) {
+              return errResult(`spawn_bg delete failed: ${e.message ?? e}`);
+            }
+          }
+          case "list": {
+            const all = [...children.values()].filter((c) => c.kind === "proc");
+            if (!all.length) return textResult("No background processes this session.", { count: 0 });
+            return textResult(
+              all.map(summary).join("\n"),
+              { count: all.length, procs: all.map((c) => ({ id: c.id, label: c.label, status: c.state })) },
+            );
+          }
+        }
+      } catch (e: any) {
+        return errResult(`spawn_bg ${params.action} failed: ${e.message ?? e}`);
+      }
+    },
+  });
+  pi.registerTool(bgTool);
+
   // Messages, not ui.notify: notify is fire-and-forget over RPC and
   // desktop surfaces messages. Errors ride the same channel.
   const note = (content: string, details?: unknown) =>
     pi.sendMessage({ customType: "spawn-note", content, display: true, details });
 
   async function cmdStatus(id: string | undefined) {
-    const all = [...children.values()];
+    const all = [...children.values()].filter((c) => c.kind !== "proc");
     if (id) {
       let c: Child | undefined;
       try {
@@ -602,7 +812,30 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     note(
-      all.length ? all.map(summary).join("\n") : "No spawned children this session.",
+      all.length ? all.map(summary).join("\n") : "No spawned subagents this session.",
+      { count: all.length },
+    );
+  }
+
+  async function cmdProcStatus(id: string | undefined) {
+    const all = [...children.values()].filter((c) => c.kind === "proc");
+    if (id) {
+      let c: Child | undefined;
+      try {
+        c = resolveChild(id);
+      } catch (e: any) {
+        note(e.message ?? String(e));
+        return;
+      }
+      if (!c || c.kind !== "proc") {
+        note(`'${noChild(id)}'`);
+        return;
+      }
+      note(summary(c), { id: c.id });
+      return;
+    }
+    note(
+      all.length ? all.map(summary).join("\n") : "No background processes this session.",
       { count: all.length },
     );
   }
@@ -692,6 +925,59 @@ export default function (pi: ExtensionAPI) {
       }
     },
   });
+  pi.registerCommand("procs", {
+    description: "List background processes with ids and states",
+    handler: async () => {
+      await cmdProcStatus(undefined);
+    },
+  });
+  pi.registerCommand("proc-stop", {
+    description: "Stop a background process: /proc-stop <id>",
+    handler: async (args) => {
+      const id = args.trim().split(/\s+/)[0];
+      if (!id) {
+        note("Usage: /proc-stop <id>");
+        return;
+      }
+      try {
+        const c = resolveChild(id);
+        if (!c || c.kind !== "proc") {
+          note(`'${noChild(id)}'`);
+          return;
+        }
+        if (c.state !== "running") {
+          note(`${c.id} [${c.label}] is already ${c.state}.`, { id: c.id });
+          return;
+        }
+        await stopChild(pi, c.id);
+        note(`Stopped ${c.id} [${c.label}].`, { id: c.id });
+      } catch (e: any) {
+        note(e.message ?? String(e));
+      }
+    },
+  });
+  pi.registerCommand("proc-status", {
+    description: "Show a background process: /proc-status <id>",
+    handler: async (args) => {
+      await cmdProcStatus(args.trim().split(/\s+/)[0]);
+    },
+  });
+  pi.registerCommand("proc-delete", {
+    description: "Delete a background process and its log files: /proc-delete <id>",
+    handler: async (args) => {
+      const id = args.trim().split(/\s+/)[0];
+      if (!id) {
+        note("Usage: /proc-delete <id>");
+        return;
+      }
+      try {
+        const key = resolveChild(id)?.id ?? id;
+        await deleteChild(pi, key);
+      } catch (e: any) {
+        note(e.message ?? String(e));
+      }
+    },
+  });
 
   pi.on("session_shutdown", () => {
     for (const c of children.values()) {
@@ -699,7 +985,8 @@ export default function (pi: ExtensionAPI) {
         c.state = "stopped";
         c.endedAt = Date.now();
         c.error = "parent session ended";
-        try { c.proc.kill("SIGKILL"); } catch { /* ignore */ }
+        try { c.logStream?.end(); } catch { /* ignore */ }
+        killTree(c, "SIGKILL");
       }
     }
     children.clear();
