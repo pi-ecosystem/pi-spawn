@@ -298,6 +298,12 @@ async function startChild(
   if (opts.thinking) args.push("--thinking", opts.thinking);
   if (opts.tools) args.push("--tools", opts.tools);
   if (opts.excludeTools) args.push("--exclude-tools", opts.excludeTools);
+  // Desktop app prompt transport: pi-desktop sets PI_DESKTOP_APP_PROMPT_TEXT
+  // in the parent env (CLI flags don't propagate to grandchildren; env does).
+  // Explicit flag, so it applies even to --isolated children. Inherited
+  // further down automatically since every level spreads process.env.
+  const appPrompt = process.env.PI_DESKTOP_APP_PROMPT_TEXT;
+  if (appPrompt && appPrompt.trim()) args.push("--append-system-prompt", appPrompt);
   if (opts.isolated) args.push("--no-extensions", "--no-skills", "--no-mcp", "--no-context-files");
   const self = thisFile();
   if (opts.nested !== false && self) args.push("--extension", self);
