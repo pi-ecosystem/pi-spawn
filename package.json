@@ -7,8 +7,18 @@
   "types": "./index.ts",
   "keywords": [
     "pi-package",
+    "pi-extension",
     "subagents",
     "agents"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "SPAWN.md",
+    "LICENSE"
   ],
   "pi": {
     "extensions": [
