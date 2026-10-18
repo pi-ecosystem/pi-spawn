@@ -83,6 +83,17 @@ Depth cap 3, max 8 live children per session, enforced by env + counters.
 
 No other types. The Agents panel renders these; nothing else to parse.
 
+## Interactive CLI rendering
+
+The desktop draws its own cards; the terminal gets one-line status
+renderers registered for every type above (plus the `spawn-bg-*`
+trio): `◌ label (id) — subagent running`, `● label (id) — done`,
+`■ label (id) — failed`, procs add `· exit N`. Static text — the TUI
+re-renders on updates, so no ticking or morphing. `spawn-note` keeps
+the default box. A `spawn` editor widget shows live counts
+(`◌ 2 agents · 1 proc running`) while anything runs, cleared on idle.
+Desktop and RPC hosts never consult any of this.
+
 ## Slash (same code paths, for UI buttons and typing)
 
 - `/agents` — list with ids + states (via `spawn-note`)

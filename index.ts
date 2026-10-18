@@ -21,7 +21,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 
 const MAX_DEPTH = 3;
 const CMD_TIMEOUT_MS = 30_000;
@@ -126,6 +127,71 @@ function summary(c: Child): string {
   const tail = c.finalText ? ` — ${c.finalText.slice(0, 200)}` : "";
   const err = c.error ? ` — error: ${c.error.slice(0, 300)}` : "";
   return `${c.id} [${c.label}] ${c.state} · ${fmtElapsed(c)}${tail}${err}`;
+}
+
+// --- terminal (TUI) rendering ------------------------------------------------
+// The desktop app draws its own cards; the interactive CLI would otherwise
+// show every spawn message as a generic purple box. These one-line status
+// renderers give it the same at-a-glance state. Static text by design:
+// the TUI re-renders on updates, so no ticking or morphing is needed.
+// spawn-note keeps the default box (lists read fine as markdown).
+
+function fmtMs(ms: number): string {
+  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+function statusElapsed(d: any): string {
+  const ms = typeof d.durationMs === "number" ? d.durationMs
+    : typeof d.startedAt === "number" ? Date.now() - d.startedAt : -1;
+  return ms < 0 ? "" : ` · ${fmtMs(ms)}`;
+}
+
+function idLabel(d: any): { id: string; label: string } {
+  const id = typeof d.id === "string" ? d.id : "";
+  const label = typeof d.label === "string" && d.label ? d.label : id;
+  return { id, label };
+}
+
+function agentLine(state: string, d: any): string {
+  const { id, label } = idLabel(d);
+  if (state === "running") return `◌ ${label} (${id}) — subagent running${statusElapsed(d)}`;
+  if (state === "done") return `● ${label} (${id}) — done${statusElapsed(d)}`;
+  return `■ ${label} (${id}) — ${state}${statusElapsed(d)}`;
+}
+
+function procLine(state: string, d: any): string {
+  const { id, label } = idLabel(d);
+  const exit = typeof d.exitCode === "number" ? ` · exit ${d.exitCode}` : "";
+  if (state === "running") return `◌ ${label} (${id}) — proc running${statusElapsed(d)}`;
+  if (state === "done") return `● ${label} (${id}) — done${exit}${statusElapsed(d)}`;
+  return `■ ${label} (${id}) — ${state}${exit}${statusElapsed(d)}`;
+}
+
+function statusOf(d: any, fallback: string): string {
+  return typeof d.status === "string" ? d.status : fallback;
+}
+
+// --- editor widget: live counts ------------------------------------------------
+// The CLI equivalent of the desktop badge: one quiet line above the
+// editor while anything runs, gone when idle. TUI-only by design
+// (mode guard); other modes never see it.
+let tuiCtx: ExtensionContext | undefined;
+
+function refreshWidget() {
+  try {
+    if (!tuiCtx || tuiCtx.mode !== "tui") return;
+    const rs = [...children.values()].filter((c) => c.state === "running");
+    if (!rs.length) {
+      tuiCtx.ui.setWidget("spawn", undefined);
+      return;
+    }
+    const na = rs.filter((c) => c.kind !== "proc").length;
+    const np = rs.length - na;
+    const bits: string[] = [];
+    if (na) bits.push(`${na} agent${na === 1 ? "" : "s"}`);
+    if (np) bits.push(`${np} proc${np === 1 ? "" : "es"}`);
+    tuiCtx.ui.setWidget("spawn", [`◌ ${bits.join(" · ")} running`]);
+  } catch { /* headless host or torn-down UI */ }
 }
 
 // --- minimal RPC client over the child process ----------------------------
@@ -294,6 +360,7 @@ async function startChild(
       },
     );
   } catch { /* host without message channel; status still works */ }
+  refreshWidget();
   return { child: c, continuedFrom };
 }
 
@@ -302,6 +369,7 @@ async function finishChild(pi: ExtensionAPI, c: Child, state: ChildState, error?
   c.state = state;
   c.endedAt = Date.now();
   if (error) c.error = error;
+  refreshWidget();
   for (const [, p] of c.pending) {
     clearTimeout(p.timer);
     p.rej(new Error(`child ${c.id} finished`));
@@ -422,6 +490,7 @@ async function startProc(
       details: { id, thread: id, kind: "proc", label, command: opts.command, logFile, startedAt: Date.now(), pid: proc.pid ?? undefined },
     });
   } catch { /* host without message channel; status still works */ }
+  refreshWidget();
   return c;
 }
 
@@ -430,6 +499,7 @@ async function finishProc(pi: ExtensionAPI, c: Child, state: ChildState, error?:
   c.state = state;
   c.endedAt = Date.now();
   if (error) c.error = error;
+  refreshWidget();
   try { c.logStream?.end(); } catch { /* ignore */ }
   const type = state === "done" ? "spawn-bg-done" : "spawn-bg-stopped";
   const exit = c.exitCode != null ? `exit ${c.exitCode}` : state;
@@ -564,6 +634,7 @@ async function deleteChild(pi: ExtensionAPI, id: string): Promise<{ id: string; 
   // A continuation's record lives under its newer run id: drop that too
   // or list/status keeps showing a stopped child for a deleted thread.
   if (c && c.id !== id) children.delete(c.id);
+  refreshWidget();
   // Silent by design (display:false): the row vanishing IS the feedback.
   // The entry persists in history purely as the tombstone, so rebuilds
   // re-bury it without ever rendering anything in chat. Fire-and-forget:
@@ -789,6 +860,16 @@ export default function (pi: ExtensionAPI) {
   });
   pi.registerTool(bgTool);
 
+  // Terminal rendering for the interactive CLI: one-line status where
+  // the desktop draws cards. RPC/desktop hosts never consult these.
+  // spawn-note keeps the default box (lists read fine as markdown).
+  pi.registerMessageRenderer("spawn-started", (m) => new Text(agentLine("running", (m as any).details ?? {})));
+  pi.registerMessageRenderer("spawn-done", (m) => new Text(agentLine("done", (m as any).details ?? {})));
+  pi.registerMessageRenderer("spawn-stopped", (m) => new Text(agentLine(statusOf((m as any).details ?? {}, "stopped"), (m as any).details ?? {})));
+  pi.registerMessageRenderer("spawn-bg-started", (m) => new Text(procLine("running", (m as any).details ?? {})));
+  pi.registerMessageRenderer("spawn-bg-done", (m) => new Text(procLine("done", (m as any).details ?? {})));
+  pi.registerMessageRenderer("spawn-bg-stopped", (m) => new Text(procLine(statusOf((m as any).details ?? {}, "stopped"), (m as any).details ?? {})));
+
   // Messages, not ui.notify: notify is fire-and-forget over RPC and
   // desktop surfaces messages. Errors ride the same channel.
   const note = (content: string, details?: unknown) =>
@@ -979,6 +1060,10 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.on("session_start", (_ev, ctx) => {
+    tuiCtx = ctx;
+    refreshWidget();
+  });
   pi.on("session_shutdown", () => {
     for (const c of children.values()) {
       if (c.state === "running") {
@@ -990,5 +1075,6 @@ export default function (pi: ExtensionAPI) {
       }
     }
     children.clear();
+    refreshWidget();
   });
 }
