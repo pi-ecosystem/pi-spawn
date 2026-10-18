@@ -693,7 +693,7 @@ export default function (pi: ExtensionAPI) {
     name: "spawn_agent",
     label: "Spawn Agent",
     description:
-      "Run a subagent: a full pi session as a child of this session. start launches async and returns an id immediately (never blocks); completion wakes you with the result. continueFrom relaunches a finished child attached to a copy of its transcript (refuse while it is running — steer instead). status peeks, steer redirects the live run, followup queues for its next turn, stop ends it (transcript kept), delete stops it and removes its transcript files, list shows all children. Children inherit host defaults unless model/thinking/tools/cwd override them.",
+      "Run a subagent: a full pi session as a child of this session. start launches async and returns an id immediately (never blocks); completion wakes you with the result. NEVER sleep/wait/block for a child — end your turn and the wake will find you; status is for occasional spot-checks, not polling loops (an aborted sleep can take the child down with it). continueFrom relaunches a finished child attached to a copy of its transcript (refuse while it is running — steer instead). status peeks, steer redirects the live run, followup queues for its next turn, stop ends it (transcript kept), delete stops it and removes its transcript files, list shows all children. Children inherit host defaults unless model/thinking/tools/cwd override them.",
     parameters: SpawnParams,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const cwd = (ctx as any).cwd ?? process.cwd();
@@ -804,7 +804,7 @@ export default function (pi: ExtensionAPI) {
     name: "spawn_bg",
     label: "Spawn BG",
     description:
-      "Run a background process: a shell command as a child of this session. start launches async and returns an id plus a log file path immediately (never blocks, never streams output); stdout+stderr append to that file. Completion wakes you with the exit code and the log path — read the log with your own tools. status peeks (state + exit code + log path, never content), stop ends it (SIGTERM then SIGKILL, log kept), delete stops it and removes its log files, list shows all background processes.",
+      "Run a background process: a shell command as a child of this session. start launches async and returns an id plus a log file path immediately (never blocks, never streams output); stdout+stderr append to that file. Completion wakes you with the exit code and the log path — read the log with your own tools. NEVER sleep/wait/block for a proc — end your turn and the wake will find you status peeks (state + exit code + log path, never content), stop ends it (SIGTERM then SIGKILL, log kept), delete stops it and removes its log files, list shows all background processes.",
     parameters: BgParams,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const cwd = (ctx as any).cwd ?? process.cwd();

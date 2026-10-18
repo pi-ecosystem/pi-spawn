@@ -44,6 +44,22 @@ process group. Completion wakes the parent via `spawn-bg-done` with
 `details{id,label,status,exitCode,logFile,durationMs,command}` — id +
 exit + path only, never log bytes.
 
+## Waiting on completion (do NOT sleep-poll)
+
+`start` is fire-and-forget by design: you get `{ id }` and go do other
+work (or end your turn). The `spawn-done` / `spawn-bg-done` wake finds
+you when it finishes — that wake IS the notification, no checking
+needed. Rules:
+
+1. Never `sleep N` / `wait` / busy-loop to block for a child or proc.
+   It burns the turn doing nothing, and if the sleep is aborted the
+   child can go down with it (aborted parent = aborted spawn).
+2. `status` is for occasional spot-checks (state + elapsed, never log
+   content), not a polling loop. Read the log file directly when you
+   need detail.
+3. One `status` after a long silence is fine; ten in a row is a bug in
+your plan, not diligence.
+
 ## Slash
 
 - `/procs` — list bg procs (via `spawn-note`)
