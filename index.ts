@@ -414,9 +414,23 @@ async function deleteChild(pi: ExtensionAPI, id: string): Promise<{ id: string; 
   try {
     dirExists = fs.statSync(dir).isDirectory();
   } catch { /* already gone */ }
-  // Neither a live record nor transcript files: refuse a feel-good
-  // success for a typo'd or ambiguous id.
-  if (!c && !dirExists) throw new Error(`'${noChild(id)}'`);
+  // Neither a live record nor transcript files (failed starts clean their
+  // dir; restarts clear live runs): already gone is already gone. Converge
+  // with a silent tombstone so the UI buries the row instead of flashing
+  // a `no live child` error into chat for a delete the user just asked
+  // for. Ambiguous prefixes still throw above in resolveChild; typo'd ids
+  // converge to a buried row keyed by that id, never a chat error.
+  if (!c && !dirExists) {
+    try {
+      pi.sendMessage({
+        customType: "spawn-note",
+        content: `Deleted ${id} (already gone).`,
+        display: false,
+        details: { id, deleted: true },
+      });
+    } catch { /* parent gone; nothing to converge */ }
+    return { id, label: id };
+  }
   fs.rmSync(dir, { recursive: true, force: true });
   children.delete(id);
   // A continuation's record lives under its newer run id: drop that too
