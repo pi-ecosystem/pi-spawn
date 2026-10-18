@@ -31,5 +31,9 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pi-ecosystem/pi-spawn.git"
+  }
 }
