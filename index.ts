@@ -189,8 +189,11 @@ function refreshWidget() {
     const np = rs.length - na;
     const bits: string[] = [];
     if (na) bits.push(`${na} agent${na === 1 ? "" : "s"}`);
-    if (np) bits.push(`${np} proc${np === 1 ? "" : "es"}`);
-    tuiCtx.ui.setWidget("spawn", [`◌ ${bits.join(" · ")} running`]);
+    if (np) bits.push(`${np} proc${np === 1 ? "" : "s"}`);
+    // Trailing "" renders as a blank line below the count: without it the
+    // widget sits flush against the editor border (host adds a spacer only
+    // above the widget, never below).
+    tuiCtx.ui.setWidget("spawn", [`◌ ${bits.join(" · ")} running`, ""]);
   } catch { /* headless host or torn-down UI */ }
 }
 
