@@ -872,12 +872,12 @@ export default function (pi: ExtensionAPI) {
   // Terminal rendering for the interactive CLI: one-line status where
   // the desktop draws cards. RPC/desktop hosts never consult these.
   // spawn-note keeps the default box (lists read fine as markdown).
-  pi.registerMessageRenderer("spawn-started", (m) => new Text(agentLine("running", (m as any).details ?? {})));
-  pi.registerMessageRenderer("spawn-done", (m) => new Text(agentLine("done", (m as any).details ?? {})));
-  pi.registerMessageRenderer("spawn-stopped", (m) => new Text(agentLine(statusOf((m as any).details ?? {}, "stopped"), (m as any).details ?? {})));
-  pi.registerMessageRenderer("spawn-bg-started", (m) => new Text(procLine("running", (m as any).details ?? {})));
-  pi.registerMessageRenderer("spawn-bg-done", (m) => new Text(procLine("done", (m as any).details ?? {})));
-  pi.registerMessageRenderer("spawn-bg-stopped", (m) => new Text(procLine(statusOf((m as any).details ?? {}, "stopped"), (m as any).details ?? {})));
+  pi.registerMessageRenderer("spawn-started", (m) => new Text(agentLine("running", (m as any).details ?? {}), 0, 0));
+  pi.registerMessageRenderer("spawn-done", (m) => new Text(agentLine("done", (m as any).details ?? {}), 0, 0));
+  pi.registerMessageRenderer("spawn-stopped", (m) => new Text(agentLine(statusOf((m as any).details ?? {}, "stopped"), (m as any).details ?? {}), 0, 0));
+  pi.registerMessageRenderer("spawn-bg-started", (m) => new Text(procLine("running", (m as any).details ?? {}), 0, 0));
+  pi.registerMessageRenderer("spawn-bg-done", (m) => new Text(procLine("done", (m as any).details ?? {}), 0, 0));
+  pi.registerMessageRenderer("spawn-bg-stopped", (m) => new Text(procLine(statusOf((m as any).details ?? {}, "stopped"), (m as any).details ?? {}), 0, 0));
 
   // Messages, not ui.notify: notify is fire-and-forget over RPC and
   // desktop surfaces messages. Errors ride the same channel.
