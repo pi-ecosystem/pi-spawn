@@ -1,56 +1,48 @@
-# pi-spawn
+# pi-jobs
 
 [![Node 22+](https://img.shields.io/badge/Node-22+-green.svg)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Subagents for pi — sessions all the way down.**
+**Persistent job scheduler for pi — any shell command, tracked per session.**
 
-`pi-spawn` is a native Pi extension. A subagent is a pi session whose parent
-is another session instead of the UI. Same verbs at every level: prompt /
-steer / followup / stop / status / transcript. Async-first: `start` returns
-an id immediately; completion wakes the parent with the result.
+`pi-jobs` is a native Pi extension. One primitive: a **job** (detached
+process, direct-to-file logs, JSON registry on disk). Jobs survive parent
+exit and reboot: dead pids reconcile to `interrupted` on next start and
+relaunch per restart policy.
 
 ## Installation
 
 Prereqs: Node 22+ and the [`pi` CLI](https://pi.dev).
 
 ```bash
-pi install git:github.com/pi-ecosystem/pi-spawn   # or: pi install ./pi-spawn
+pi install git:github.com/pi-ecosystem/pi-jobs   # or: pi install ./pi-jobs
 # one-off: pi --extension ./index.ts
 ```
 
-## Tools
+## Tool
 
-| Tool / command | What it does |
+| Action | What it does |
 |---|---|
-| `spawn_agent` | `start` (async, returns `{id}`), `status`, `stop`, `steer`, `followup`, `list`, `delete` |
-| `spawn_bg` | `start` (async, returns `{id, logFile}`), `status`, `stop`, `list`, `delete` |
-| `/agents` | list spawned subagents with ids + states |
-| `/agent-stop <id>` | stop a subagent, keep its transcript |
-| `/agent-steer <id> <msg>` | redirect a live subagent |
-| `/agent-status <id>` | peek at a subagent |
-| `/agent-delete <id>` | stop + remove transcript files |
-| `/procs` | list background processes with ids + states |
-| `/proc-stop <id>` | stop a process, keep its log |
-| `/proc-status <id>` | peek at a process |
-| `/proc-delete <id>` | stop + remove log files |
+| `job submit` | run async (returns `{jobId, runId, logFile}`), opts: `restart: no\|on-failure\|always`, `maxRestarts`, `cwd`, `env`, `label`, `logFile` (job-owned log, e.g. pi session jsonl — `logs` reads it instead) |
+| `job list` | `scope: mine\|all\|orphans`, optional `state` filter |
+| `job get` | job or run detail (id or prefix) |
+| `job logs` | last N lines of the run log (never inlined into wakes) |
+| `job kill` | SIGTERM then SIGKILL, log kept |
+| `job retry` | fresh run of the same job |
+| `job delete` | kill + remove job/runs/files |
+| `job adopt` | claim an orphan job into this session |
 
-Children are real `pi --mode rpc` subprocesses and inherit the host's
-model/thinking/tools unless overridden. See [SPAWN.md](./SPAWN.md) for the
-full protocol: threads, messages, slash commands, and boundaries
-(headless children, no cross-talk to the user, tree discipline).
+Slash: `/jobs [mine|all|orphans]`, `/job-kill`, `/job-logs`, `/job-retry`, `/job-delete`.
 
-## With pi-desktop
-
-[pi-desktop](https://github.com/pi-ecosystem/pi-desktop) vendors this
-package and loads it into every session via `--extension`, so desktop
-users get subagents with no install step.
+Storage: `~/.pi/agent/jobs/registry.json` + `runs/<runId>/output.log`.
+Detached (`detached:true`, `shell:true`) + `unref`, stdio direct to log
+file. Poller (5s) settles runs the current process didn't start.
 
 ## Develop
 
 ```bash
-git clone git@github.com:pi-ecosystem/pi-spawn.git
-cd pi-spawn
+git clone git@github.com:pi-ecosystem/pi-jobs.git
+cd pi-jobs
 npm install
 npm run typecheck
 ```

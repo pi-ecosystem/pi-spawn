@@ -1,15 +1,16 @@
 {
-  "name": "pi-spawn",
+  "name": "pi-jobs",
   "version": "0.1.0",
-  "description": "Pi extension: spawn subagent sessions. A subagent is a pi session whose parent is another session.",
+  "description": "Pi extension: persistent cross-platform job scheduler. Run any shell command as a tracked, session-mapped background job.",
   "type": "module",
   "main": "./index.ts",
   "types": "./index.ts",
   "keywords": [
     "pi-package",
     "pi-extension",
-    "subagents",
-    "agents"
+    "jobs",
+    "scheduler",
+    "background"
   ],
   "engines": {
     "node": ">=22"
@@ -17,12 +18,16 @@
   "files": [
     "index.ts",
     "README.md",
-    "SPAWN.md",
-    "LICENSE"
+    "JOBS.md",
+    "LICENSE",
+    "skills/"
   ],
   "pi": {
     "extensions": [
       "./index.ts"
+    ],
+    "skills": [
+      "./skills/pi-jobs"
     ]
   },
   "peerDependencies": {
@@ -46,6 +51,6 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/pi-ecosystem/pi-spawn.git"
+    "url": "git+https://github.com/pi-ecosystem/pi-jobs.git"
   }
 }
