@@ -14,7 +14,7 @@ spot-checks only.
 - `list {scope?: mine|all|orphans, state?}`, `get {id}`, `logs {id, tail?}`
 - `kill {id}`, `retry {id}`, `delete {id}`, `adopt {id}`
 - Ids accept exact, run, or unambiguous prefix.
-- `list` scopes: `mine` (this session), `all`, `orphans` (other sessions').
+- `list` scopes: `mine` (this session, default), `all`, `orphans` (other sessions').
   `adopt` claims an orphan into this session.
 - `restart`: `no` (default), `on-failure` (rerun if exit != 0), `always`.
   `maxRestarts` caps auto-reruns (default 10, 0 = unlimited).

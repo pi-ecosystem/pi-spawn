@@ -12,12 +12,12 @@ log path only, never log bytes).
 | action | params | result |
 |---|---|---|
 | `submit` | `command`, `label?`, `cwd?`, `env?`, `restart=no\|on-failure\|always`, `maxRestarts?=10 (0=unlimited)`, `logFile?` (job-owned log path — `logs`/wakes read it instead of captured stdout; scheduler never writes there) | `{jobId, runId, logFile}` immediately |
-| `list` | `scope=mine\|all\|orphans`, `state?` | jobs + last run state |
+| `list` | `scope=mine\|all\|orphans` (default `mine`), `state?` | jobs + last run state |
 | `get` | `id` (job/run id or prefix) | detail |
 | `logs` | `id`, `tail?=50` | last N lines |
 | `kill` | `id` | stops runs, keeps logs |
 | `retry` | `id` | fresh run |
-| `delete` | `id` | kills + removes files + registry entries |
+| `delete` | `id` | kills + removes files + db entries |
 | `adopt` | `id` | claim orphan into this session |
 
 ## Waiting on completion (do NOT sleep-poll)
@@ -27,10 +27,10 @@ wake IS the notification. `get`/`logs` are spot-checks, never loops.
 
 ## Persistence + reboot
 
-- Disk: `~/.pi/agent/jobs/registry.json` + `runs/<runId>/output.log`.
+- Disk: `~/.pi/agent/jobs/jobs.db` (SQLite WAL, concurrent-session safe) + `runs/<runId>/output.log`.
 - Processes are detached + unref'd, stdio direct to file.
-- `session_shutdown` does NOT kill jobs — only persists + stops polling.
-- `session_start` loads registry, reconciles `running` runs with dead pids
+- `session_shutdown` does NOT kill jobs — every mutation is already in SQLite; it only stops polling.
+- `session_start` opens the db, reconciles `running` runs with dead pids
   → `interrupted`, relaunches per `restart` policy, restarts the 5s poller.
 - Poller settles runs this process didn't start (exit code unknown, log
   tail is the record) and emits the wake.

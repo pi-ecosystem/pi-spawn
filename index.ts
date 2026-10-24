@@ -5,10 +5,15 @@
  * no transcripts. The ONLY pi-specific bits are (1) this runs as a pi
  * extension and (2) jobs are mapped to the pi session that submitted them.
  *
- * Persistence: registry (jobs + runs) lives on disk as JSON, logs per run.
+ * Persistence: jobs + runs live in ONE SQLite db (WAL + busy_timeout), logs
+ * per run on disk. SQLite serializes concurrent writers, so any number of
+ * live pi sessions share the db safely — no last-writer-wins.
  * Reboot kills processes (true for anything) but data survives: on the next
  * `session_start` we reconcile `running` runs against live pids — dead ones
  * become `interrupted` and relaunch per their restart policy.
+ *
+ * Visibility: a session sees its OWN jobs by default. Cross-session
+ * (`all` / `orphans`, explicit ids, adopt) is opt-in, for cleanup and whatnot.
  *
  * Portable resume = rehydrate when pi starts. True boot-without-login resume
  * needs OS hooks (systemd/launchd/Task Scheduler) — later, behind this API.
@@ -18,6 +23,7 @@ import { spawn as nodeSpawn, spawnSync, type ChildProcess } from "node:child_pro
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -58,20 +64,14 @@ interface Run {
   error?: string;
 }
 
-interface Registry {
-  version: 1;
-  jobs: Record<string, Job>;
-  runs: Record<string, Run>;
-}
-
 const POLL_MS = 5_000;
 const KILL_GRACE_MS = 5_000;
 
 function jobsRoot(): string {
   return path.join(os.homedir(), ".pi", "agent", "jobs");
 }
-function registryPath(): string {
-  return path.join(jobsRoot(), "registry.json");
+function dbPath(): string {
+  return path.join(jobsRoot(), "jobs.db");
 }
 function runDir(runId: string): string {
   return path.join(jobsRoot(), "runs", runId);
@@ -80,11 +80,102 @@ function runDir(runId: string): string {
 let counter = 0;
 function rid(prefix: string): string {
   counter += 1;
-  return `${prefix}-${Date.now().toString(36)}-${counter.toString(36)}`;
+  // pid + random: ids must be unique across concurrent pi sessions on one box.
+  return `${prefix}-${Date.now().toString(36)}${process.pid.toString(36)}-${counter.toString(36)}${Math.floor(Math.random() * 1296).toString(36).padStart(2, "0")}`;
 }
-// --- registry (disk = source of truth) -------------------------------------
 
-let reg: Registry = { version: 1, jobs: {}, runs: {} };
+// --- sqlite store (single file, safe for concurrent sessions) ----------------
+
+let _db: DatabaseSync | undefined;
+
+function db(): DatabaseSync {
+  if (_db) return _db;
+  fs.mkdirSync(path.join(jobsRoot(), "runs"), { recursive: true });
+  const d = new DatabaseSync(dbPath());
+  d.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;");
+  d.exec(`CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    command TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    env TEXT,
+    session_id TEXT,
+    session_file TEXT,
+    restart TEXT NOT NULL DEFAULT 'no',
+    max_restarts INTEGER NOT NULL DEFAULT 10,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );`);
+  d.exec(`CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES jobs(id),
+    pid INTEGER,
+    state TEXT NOT NULL DEFAULT 'running',
+    exit_code INTEGER,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    log_file TEXT NOT NULL,
+    custom_log TEXT,
+    error TEXT
+  );`);
+  d.exec("CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id);");
+  d.exec("CREATE INDEX IF NOT EXISTS idx_runs_job ON runs(job_id);");
+  d.exec("CREATE INDEX IF NOT EXISTS idx_runs_state ON runs(state);");
+  _db = d;
+  return d;
+}
+
+function rowToJob(r: any): Job {
+  return {
+    id: r.id,
+    label: r.label,
+    command: r.command,
+    cwd: r.cwd,
+    env: r.env ? JSON.parse(r.env) : undefined,
+    sessionId: r.session_id ?? undefined,
+    sessionFile: r.session_file ?? undefined,
+    restart: r.restart as RestartPolicy,
+    maxRestarts: r.max_restarts,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+function rowToRun(r: any): Run {
+  return {
+    runId: r.run_id,
+    jobId: r.job_id,
+    pid: r.pid ?? undefined,
+    state: r.state as RunState,
+    exitCode: r.exit_code ?? undefined,
+    startedAt: r.started_at,
+    endedAt: r.ended_at ?? undefined,
+    logFile: r.log_file,
+    customLog: r.custom_log ?? undefined,
+    error: r.error ?? undefined,
+  };
+}
+
+function getJob(id: string): Job | undefined {
+  const row = db().prepare("SELECT * FROM jobs WHERE id = ?").get(id) as any;
+  return row ? rowToJob(row) : undefined;
+}
+
+function getRun(runId: string): Run | undefined {
+  const row = db().prepare("SELECT * FROM runs WHERE run_id = ?").get(runId) as any;
+  return row ? rowToRun(row) : undefined;
+}
+
+function runsOf(jobId: string, limit?: number): Run[] {
+  const rows = db()
+    .prepare(`SELECT * FROM runs WHERE job_id = ? ORDER BY started_at DESC${limit ? ` LIMIT ${limit}` : ""}`)
+    .all(jobId) as any[];
+  return rows.map(rowToRun);
+}
+
+function latestRun(jobId: string): Run | undefined {
+  return runsOf(jobId, 1)[0];
+}
 
 // Live handles only exist for runs started by THIS process. Anything else
 // (previous boot, other session) is managed by pid + log file only.
@@ -92,26 +183,6 @@ const live = new Map<string, { proc: ChildProcess; fd: number }>();
 const stopping = new Set<string>(); // runIds being killed -> settle as killed
 let pollTimer: NodeJS.Timeout | undefined;
 let tuiCtx: ExtensionContext | undefined;
-
-function load(): void {
-  try {
-    fs.mkdirSync(path.join(jobsRoot(), "runs"), { recursive: true });
-  } catch { /* ignore */ }
-  try {
-    const raw = fs.readFileSync(registryPath(), "utf8");
-    const parsed = JSON.parse(raw) as Registry;
-    if (parsed && parsed.jobs && parsed.runs) reg = parsed;
-  } catch { /* first run: start empty */ }
-}
-
-function save(): void {
-  try {
-    fs.mkdirSync(jobsRoot(), { recursive: true });
-    const tmp = path.join(jobsRoot(), `registry.tmp.${process.pid}`);
-    fs.writeFileSync(tmp, JSON.stringify(reg, null, 2));
-    fs.renameSync(tmp, registryPath());
-  } catch { /* best effort; memory still works this session */ }
-}
 
 function pidAlive(pid: number | undefined): boolean {
   if (!pid) return false;
@@ -174,18 +245,40 @@ function fmtElapsed(startedAt: number, endedAt?: number): string {
 }
 
 function runSummary(r: Run): string {
-  const j = reg.jobs[r.jobId];
-  const label = j?.label ?? r.jobId;
+  const label = getJob(r.jobId)?.label ?? r.jobId;
   const exit = r.exitCode != null ? ` · exit ${r.exitCode}` : "";
   const err = r.error ? ` — ${r.error.slice(0, 200)}` : "";
   return `${r.runId} [${label}] ${r.state} · ${fmtElapsed(r.startedAt, r.endedAt)}${exit}${err}\nLogs: ${effLog(r)}`;
 }
 
 function jobSummary(j: Job): string {
-  const runs = Object.values(reg.runs).filter((r) => r.jobId === j.id);
-  const last = runs.sort((a, b) => b.startedAt - a.startedAt)[0];
+  const runs = runsOf(j.id);
+  const last = runs[0];
   const sess = j.sessionId ? ` · session ${j.sessionId.slice(0, 12)}` : "";
   return `${j.id} [${j.label}] restart=${j.restart}${sess} · ${runs.length} run${runs.length === 1 ? "" : "s"}${last ? ` · last: ${last.state}` : ""}`;
+}
+
+function listJobs(sessionId: string | undefined, scope: string, state?: string): Job[] {
+  const d = db();
+  let rows: any[];
+  if (scope === "mine") {
+    if (!sessionId) return [];
+    rows = d.prepare("SELECT * FROM jobs WHERE session_id = ? ORDER BY created_at DESC").all(sessionId) as any[];
+  } else if (scope === "orphans") {
+    rows = (sessionId
+      ? d.prepare("SELECT * FROM jobs WHERE session_id IS NULL OR session_id != ? ORDER BY created_at DESC").all(sessionId)
+      : d.prepare("SELECT * FROM jobs ORDER BY created_at DESC").all()) as any[];
+  } else {
+    rows = d.prepare("SELECT * FROM jobs ORDER BY created_at DESC").all() as any[];
+  }
+  let jobs = rows.map(rowToJob);
+  if (state) {
+    const withState = new Set(
+      (d.prepare("SELECT DISTINCT job_id AS id FROM runs WHERE state = ?").all(state) as any[]).map((r) => r.id as string),
+    );
+    jobs = jobs.filter((j) => withState.has(j.id));
+  }
+  return jobs;
 }
 
 function textResult(text: string, details?: unknown) {
@@ -198,13 +291,30 @@ function errResult(text: string, details?: unknown) {
 function refreshWidget() {
   try {
     if (!tuiCtx || tuiCtx.mode !== "tui") return;
-    const n = Object.values(reg.runs).filter((r) => r.state === "running").length;
+    const sess = currentSession(tuiCtx)?.id;
+    const n = sess
+      ? (db().prepare(`SELECT COUNT(*) AS n FROM runs JOIN jobs ON jobs.id = runs.job_id
+          WHERE runs.state = 'running' AND jobs.session_id = ?`).get(sess) as any)?.n ?? 0
+      : (db().prepare("SELECT COUNT(*) AS n FROM runs WHERE state = 'running'").get() as any)?.n ?? 0;
     tuiCtx.ui.setWidget("jobs", n ? [`◌ ${n} job${n === 1 ? "" : "s"} running`, ""] : undefined);
   } catch { /* headless host */ }
 }
 
 function restartsUsed(jobId: string): number {
-  return Object.values(reg.runs).filter((r) => r.jobId === jobId).length - 1; // runs beyond the first
+  const n = (db().prepare("SELECT COUNT(*) AS n FROM runs WHERE job_id = ?").get(jobId) as any)?.n ?? 1;
+  return Math.max(0, n - 1); // runs beyond the first
+}
+
+/** Atomically claim a running run into a terminal state. Returns the settled
+ *  run, or undefined if another session already settled it. */
+function settleRun(runId: string, state: RunState, fields: { endedAt: number; exitCode?: number; error?: string }): Run | undefined {
+  const d = db();
+  const info = d.prepare(`UPDATE runs SET state = ?, ended_at = ?,
+      exit_code = COALESCE(?, exit_code), error = COALESCE(?, error)
+      WHERE run_id = ? AND state = 'running'`)
+    .run(state, fields.endedAt, fields.exitCode ?? null, fields.error ?? null, runId);
+  if (info.changes !== 1) return undefined;
+  return getRun(runId);
 }
 
 function launchRun(pi: ExtensionAPI, job: Job, run: Run): void {
@@ -221,34 +331,36 @@ function launchRun(pi: ExtensionAPI, job: Job, run: Run): void {
   });
   try { (proc as any).unref?.(); } catch { /* ignore */ }
   try { fs.closeSync(outFd); } catch { /* child holds its own dup */ }
-  run.pid = proc.pid;
-  run.state = "running";
   live.set(run.runId, { proc, fd: outFd });
+  db().prepare("UPDATE runs SET pid = ? WHERE run_id = ?").run(proc.pid ?? null, run.runId);
+  run.pid = proc.pid;
 
   proc.on("exit", (code) => {
     const wasStopping = stopping.has(run.runId);
     stopping.delete(run.runId);
     live.delete(run.runId);
-    run.endedAt = Date.now();
-    run.exitCode = code ?? undefined;
-    run.state = wasStopping ? "killed" : code === 0 ? "done" : "failed";
-    if (wasStopping && !run.error) run.error = "killed by parent";
-    save();
+    const state: RunState = wasStopping ? "killed" : code === 0 ? "done" : "failed";
+    const settled = settleRun(run.runId, state, {
+      endedAt: Date.now(),
+      exitCode: code ?? undefined,
+      error: wasStopping ? "killed by parent" : undefined,
+    });
     refreshWidget();
-    const type = run.state === "done" ? "job-done" : run.state === "killed" ? "job-killed" : "job-failed";
+    if (!settled) return; // settled elsewhere (poller/kill); announcement already sent
+    const type = state === "done" ? "job-done" : state === "killed" ? "job-killed" : "job-failed";
     try {
       pi.sendMessage(
         {
           customType: type,
-          content: `**${job.label}** (${run.runId}) ${run.state}${run.exitCode != null ? ` exit ${run.exitCode}` : ""}\nLogs: ${effLog(run)}`,
+          content: `**${job.label}** (${run.runId}) ${state}${settled.exitCode != null ? ` exit ${settled.exitCode}` : ""}\nLogs: ${effLog(settled)}`,
           display: false,
-          details: { jobId: job.id, runId: run.runId, label: job.label, status: run.state, exitCode: run.exitCode, logFile: effLog(run), durationMs: run.endedAt - run.startedAt },
+          details: { jobId: job.id, runId: run.runId, label: job.label, status: state, exitCode: settled.exitCode, logFile: effLog(settled), durationMs: (settled.endedAt ?? Date.now()) - settled.startedAt },
         },
         { triggerTurn: true },
       );
-    } catch { /* parent gone; registry keeps the result */ }
+    } catch { /* parent gone; db keeps the result */ }
     // Auto-restart per policy.
-    if (!wasStopping && (job.restart === "always" || (job.restart === "on-failure" && run.state === "failed"))) {
+    if (!wasStopping && (job.restart === "always" || (job.restart === "on-failure" && state === "failed"))) {
       if (job.maxRestarts === 0 || restartsUsed(job.id) < job.maxRestarts) {
         try { rerun(pi, undefined, job.id, "auto-restart"); } catch { /* ignore */ }
       }
@@ -257,10 +369,7 @@ function launchRun(pi: ExtensionAPI, job: Job, run: Run): void {
   proc.on("error", (e: any) => {
     stopping.delete(run.runId);
     live.delete(run.runId);
-    run.endedAt = Date.now();
-    run.state = "failed";
-    run.error = `launch failed: ${e.message ?? e}`;
-    save();
+    settleRun(run.runId, "failed", { endedAt: Date.now(), error: `launch failed: ${e.message ?? e}` });
     refreshWidget();
   });
 }
@@ -280,6 +389,7 @@ function submit(
   const sess = currentSession(ctx);
   const id = rid("job");
   const runId = rid("run");
+  const now = Date.now();
   const job: Job = {
     id,
     label: opts.label?.slice(0, 80) || opts.command.split(/\s+/).slice(0, 6).join(" ").slice(0, 48),
@@ -290,8 +400,8 @@ function submit(
     sessionFile: sess.file,
     restart: opts.restart ?? "no",
     maxRestarts: opts.maxRestarts ?? 10,
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
+    createdAt: now,
+    updatedAt: now,
   };
   const dir = runDir(runId);
   fs.mkdirSync(dir, { recursive: true });
@@ -304,12 +414,23 @@ function submit(
     customLog = p;
     try { fs.mkdirSync(path.dirname(p), { recursive: true }); } catch { /* job owns it */ }
   }
-  const run: Run = { runId, jobId: id, state: "running", startedAt: Date.now(), logFile: path.join(dir, "output.log"), ...(customLog ? { customLog } : {}) };
-  reg.jobs[id] = job;
-  reg.runs[runId] = run;
-  save();
+  const run: Run = { runId, jobId: id, state: "running", startedAt: now, logFile: path.join(dir, "output.log"), ...(customLog ? { customLog } : {}) };
+  const d = db();
+  d.exec("BEGIN IMMEDIATE;");
+  try {
+    d.prepare(`INSERT INTO jobs (id, label, command, cwd, env, session_id, session_file, restart, max_restarts, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(job.id, job.label, job.command, job.cwd, job.env ? JSON.stringify(job.env) : null,
+        job.sessionId ?? null, job.sessionFile ?? null, job.restart, job.maxRestarts, job.createdAt, job.updatedAt);
+    d.prepare(`INSERT INTO runs (run_id, job_id, pid, state, exit_code, started_at, ended_at, log_file, custom_log, error)
+      VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)`)
+      .run(run.runId, run.jobId, null, null, run.startedAt, null, run.logFile, run.customLog ?? null, null);
+    d.exec("COMMIT;");
+  } catch (e) {
+    try { d.exec("ROLLBACK;"); } catch { /* ignore */ }
+    throw e;
+  }
   launchRun(pi, job, run);
-  save();
   refreshWidget();
   try {
     pi.sendMessage({
@@ -323,89 +444,112 @@ function submit(
 }
 
 function rerun(pi: ExtensionAPI, ctx: ExtensionContext | undefined, jobId: string, reason = "manual"): Run {
-  const job = reg.jobs[jobId];
+  const job = getJob(jobId);
   if (!job) throw new Error(`no such job '${jobId}'`);
   const runId = rid("run");
   fs.mkdirSync(runDir(runId), { recursive: true });
-  const prevLog = Object.values(reg.runs).filter((r) => r.jobId === jobId).sort((a, b) => b.startedAt - a.startedAt)[0]?.customLog;
-  const run: Run = { runId, jobId, state: "running", startedAt: Date.now(), logFile: path.join(runDir(runId), "output.log"), error: reason === "manual" ? undefined : reason,
+  const prevLog = latestRun(jobId)?.customLog;
+  const now = Date.now();
+  const run: Run = { runId, jobId, state: "running", startedAt: now, logFile: path.join(runDir(runId), "output.log"), error: reason === "manual" ? undefined : reason,
     ...(prevLog ? { customLog: prevLog } : {}) };
-  job.updatedAt = Date.now();
-  reg.runs[runId] = run;
-  save();
-  launchRun(pi, job, run);
-  save();
+  const d = db();
+  d.exec("BEGIN IMMEDIATE;");
+  try {
+    d.prepare("UPDATE jobs SET updated_at = ? WHERE id = ?").run(now, jobId);
+    d.prepare(`INSERT INTO runs (run_id, job_id, pid, state, exit_code, started_at, ended_at, log_file, custom_log, error)
+      VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)`)
+      .run(run.runId, run.jobId, null, null, run.startedAt, null, run.logFile, run.customLog ?? null, run.error ?? null);
+    d.exec("COMMIT;");
+  } catch (e) {
+    try { d.exec("ROLLBACK;"); } catch { /* ignore */ }
+    throw e;
+  }
+  launchRun(pi, { ...job, updatedAt: now }, run);
   refreshWidget();
   return run;
 }
 
 async function killRun(pi: ExtensionAPI, runId: string, reason = "killed by parent"): Promise<Run> {
-  const run = reg.runs[runId];
+  const run = getRun(runId);
   if (!run) throw new Error(`no such run '${runId}'`);
   if (run.state !== "running") return run;
   const h = live.get(runId);
   if (h) {
     stopping.add(runId);
-    run.error = reason;
+    if (!run.error) db().prepare("UPDATE runs SET error = ? WHERE run_id = ? AND state = 'running'").run(reason, runId);
     killTree(h.proc, run.pid, "SIGTERM");
     const deadline = Date.now() + KILL_GRACE_MS;
-    while (Date.now() < deadline && run.state === "running") {
+    for (;;) {
+      const cur = getRun(runId);
+      if (!cur || cur.state !== "running") return cur ?? run;
+      if (Date.now() > deadline) break;
       await new Promise((r) => setTimeout(r, 200));
-      if (!pidAlive(run.pid)) break;
+      if (!pidAlive(getRun(runId)?.pid)) break;
     }
-    if (run.state === "running" && pidAlive(run.pid)) killTree(h.proc, run.pid, "SIGKILL");
-    save();
-    return run;
+    const cur = getRun(runId);
+    if (cur?.state === "running" && pidAlive(cur.pid)) killTree(h.proc, cur.pid, "SIGKILL");
+    return getRun(runId) ?? run;
   }
   // Adopted/dead-handle run: signal by pid, settle on next poll.
   if (pidAlive(run.pid)) {
     stopping.add(runId);
-    run.error = reason;
-    killPidOnly(run.pid!, "SIGTERM");
-    save();
+    if (!run.error) db().prepare("UPDATE runs SET error = ? WHERE run_id = ? AND state = 'running'").run(reason, runId);
+    if (run.pid) killPidOnly(run.pid, "SIGTERM");
   }
-  return run;
+  return getRun(runId) ?? run;
 }
 
 async function deleteJobOrRun(pi: ExtensionAPI, key: string): Promise<string> {
   const target = resolve(key);
   if (!target) throw new Error(`no such job or run '${key}'`);
   if (target.kind === "run") {
-    const run = reg.runs[target.runId as string]!;
-    if (run.state === "running") await killRun(pi, run.runId, "deleted by parent");
-    delete reg.runs[run.runId];
-    try { fs.rmSync(runDir(run.runId), { recursive: true, force: true }); } catch { /* ignore */ }
-    save();
+    const runId = target.runId as string;
+    if (getRun(runId)?.state === "running") await killRun(pi, runId, "deleted by parent");
+    db().prepare("DELETE FROM runs WHERE run_id = ?").run(runId);
+    try { fs.rmSync(runDir(runId), { recursive: true, force: true }); } catch { /* ignore */ }
     refreshWidget();
-    return run.runId;
+    return runId;
   }
-  const job = reg.jobs[target.jobId]!;
-  for (const r of Object.values(reg.runs).filter((r) => r.jobId === job.id && r.state === "running")) {
-    await killRun(pi, r.runId, "deleted by parent");
+  const jobId = target.jobId;
+  for (const r of runsOf(jobId)) {
+    if (r.state === "running") await killRun(pi, r.runId, "deleted by parent");
   }
-  for (const r of Object.values(reg.runs).filter((r) => r.jobId === job.id)) {
-    delete reg.runs[r.runId];
-    try { fs.rmSync(runDir(r.runId), { recursive: true, force: true }); } catch { /* ignore */ }
+  const gone = runsOf(jobId).map((r) => r.runId);
+  const d = db();
+  d.exec("BEGIN IMMEDIATE;");
+  try {
+    const del = d.prepare("DELETE FROM runs WHERE run_id = ?");
+    for (const runId of gone) del.run(runId);
+    d.prepare("DELETE FROM jobs WHERE id = ?").run(jobId);
+    d.exec("COMMIT;");
+  } catch (e) {
+    try { d.exec("ROLLBACK;"); } catch { /* ignore */ }
+    throw e;
   }
-  delete reg.jobs[job.id];
-  save();
+  for (const runId of gone) {
+    try { fs.rmSync(runDir(runId), { recursive: true, force: true }); } catch { /* ignore */ }
+  }
   refreshWidget();
   try {
-    pi.sendMessage({ customType: "job-note", content: `Deleted ${job.id}.`, display: false, details: { jobId: job.id, deleted: true } });
+    pi.sendMessage({ customType: "job-note", content: `Deleted ${jobId}.`, display: false, details: { jobId, deleted: true } });
   } catch { /* ignore */ }
-  return job.id;
+  return jobId;
 }
 
-/** Resolve a job id, run id, or unambiguous prefix to a concrete target. */
+/** Resolve a job id, run id, or unambiguous prefix to a concrete target.
+ *  Explicit ids always search globally (cross-session opt-in). */
 function resolve(key: string): { kind: "job" | "run"; jobId: string; runId?: string } | undefined {
   if (!key) return undefined;
-  if (reg.jobs[key]) return { kind: "job", jobId: key };
-  if (reg.runs[key]) return { kind: "run", jobId: reg.runs[key].jobId, runId: key };
-  const jHits = Object.keys(reg.jobs).filter((id) => id.startsWith(key));
-  const rHits = Object.keys(reg.runs).filter((id) => id.startsWith(key));
+  const d = db();
+  const job = d.prepare("SELECT * FROM jobs WHERE id = ?").get(key) as any;
+  if (job) return { kind: "job", jobId: job.id };
+  const run = d.prepare("SELECT * FROM runs WHERE run_id = ?").get(key) as any;
+  if (run) return { kind: "run", jobId: run.job_id, runId: run.run_id };
+  const jHits = d.prepare("SELECT id FROM jobs WHERE id LIKE ? || '%'").all(key) as any[];
+  const rHits = d.prepare("SELECT run_id, job_id FROM runs WHERE run_id LIKE ? || '%'").all(key) as any[];
   if (jHits.length + rHits.length > 1) throw new Error(`'${key}' matches multiple jobs/runs; use a longer id`);
-  if (jHits.length === 1) return { kind: "job", jobId: jHits[0] };
-  if (rHits.length === 1) return { kind: "run", jobId: reg.runs[rHits[0]].jobId, runId: rHits[0] };
+  if (jHits.length === 1) return { kind: "job", jobId: jHits[0].id };
+  if (rHits.length === 1) return { kind: "run", jobId: rHits[0].job_id, runId: rHits[0].run_id };
   return undefined;
 }
 
@@ -423,14 +567,28 @@ function readTail(logFile: string, maxLines = 50): string {
 
 function reconcile(pi: ExtensionAPI): string[] {
   const notes: string[] = [];
-  for (const run of Object.values(reg.runs)) {
-    if (run.state !== "running" || live.has(run.runId)) continue;
+  const dead: string[] = [];
+  for (const row of db().prepare("SELECT * FROM runs WHERE state = 'running'").all() as any[]) {
+    const run = rowToRun(row);
+    if (live.has(run.runId)) continue;
     if (pidAlive(run.pid)) continue; // alive from before; pid-only tracking until poll confirms death
-    run.state = "interrupted";
-    run.endedAt = Date.now();
-    run.error = "process gone (reboot or parent exit); pid not alive";
-    notes.push(`${run.runId} interrupted`);
-    const job = reg.jobs[run.jobId];
+    dead.push(run.runId);
+  }
+  if (!dead.length) {
+    refreshWidget();
+    return notes;
+  }
+  const now = Date.now();
+  const claimed: string[] = [];
+  for (const runId of dead) {
+    if (settleRun(runId, "interrupted", { endedAt: now, error: "process gone (reboot or parent exit); pid not alive" })) {
+      claimed.push(runId);
+      notes.push(`${runId} interrupted`);
+    }
+  }
+  for (const runId of claimed) {
+    const run = getRun(runId);
+    const job = run ? getJob(run.jobId) : undefined;
     if (job && (job.restart === "always" || job.restart === "on-failure")) {
       if (job.maxRestarts === 0 || restartsUsed(job.id) < job.maxRestarts) {
         try {
@@ -442,7 +600,6 @@ function reconcile(pi: ExtensionAPI): string[] {
       }
     }
   }
-  if (notes.length) save();
   refreshWidget();
   return notes;
 }
@@ -450,34 +607,37 @@ function reconcile(pi: ExtensionAPI): string[] {
 function startPoller(pi: ExtensionAPI) {
   stopPoller();
   pollTimer = setInterval(() => {
-    let changed = false;
-    for (const run of Object.values(reg.runs)) {
-      if (run.state !== "running" || live.has(run.runId)) continue;
+    const now = Date.now();
+    const settled: { runId: string; jobId: string; state: RunState; logFile: string; label: string }[] = [];
+    for (const row of db().prepare("SELECT * FROM runs WHERE state = 'running'").all() as any[]) {
+      const run = rowToRun(row);
+      if (live.has(run.runId)) continue;
       if (pidAlive(run.pid)) continue;
-      run.state = stopping.has(run.runId) ? "killed" : "interrupted";
+      const s = settleRun(run.runId, stopping.has(run.runId) ? "killed" : "interrupted",
+        { endedAt: now, error: "process exited while untracked (pid gone)" });
       stopping.delete(run.runId);
-      run.endedAt = Date.now();
-      if (!run.error) run.error = "process exited while untracked (pid gone)";
-      changed = true;
-      const job = reg.jobs[run.jobId];
+      if (s) settled.push({ runId: s.runId, jobId: s.jobId, state: s.state, logFile: effLog(s), label: getJob(s.jobId)?.label ?? s.jobId });
+    }
+    for (const s of settled) {
       try {
         pi.sendMessage(
           {
-            customType: run.state === "killed" ? "job-killed" : "job-failed",
-            content: `**${job?.label ?? run.jobId}** (${run.runId}) ${run.state}\nLogs: ${effLog(run)}`,
+            customType: s.state === "killed" ? "job-killed" : "job-failed",
+            content: `**${s.label}** (${s.runId}) ${s.state}\nLogs: ${s.logFile}`,
             display: false,
-            details: { jobId: run.jobId, runId: run.runId, status: run.state, logFile: effLog(run) },
+            details: { jobId: s.jobId, runId: s.runId, status: s.state, logFile: s.logFile },
           },
           { triggerTurn: true },
         );
       } catch { /* ignore */ }
-      if (job && (job.restart === "always" || (job.restart === "on-failure" && run.state === "interrupted"))) {
+      const job = getJob(s.jobId);
+      if (job && (job.restart === "always" || (job.restart === "on-failure" && s.state === "interrupted"))) {
         if (job.maxRestarts === 0 || restartsUsed(job.id) < job.maxRestarts) {
           try { rerun(pi, undefined, job.id, "auto-restart after interrupt"); } catch { /* ignore */ }
         }
       }
     }
-    if (changed) { save(); refreshWidget(); }
+    if (settled.length) refreshWidget();
   }, POLL_MS);
   try { (pollTimer as any).unref?.(); } catch { /* ignore */ }
 }
@@ -489,7 +649,7 @@ function stopPoller() {
 // --- extension ------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-  load();
+  db(); // open + migrate
 
   const JobParams = Type.Object({
     action: StringEnum(["submit", "list", "get", "logs", "kill", "retry", "delete", "adopt"] as const, {
@@ -503,7 +663,7 @@ export default function (pi: ExtensionAPI) {
     restart: Type.Optional(Type.String({ description: "submit: restart policy no|on-failure|always (default no)" })),
     maxRestarts: Type.Optional(Type.Number({ description: "submit: cap on auto-restarts, 0=unlimited (default 10)" })),
     logFile: Type.Optional(Type.String({ description: "submit: job-owned log path (e.g. pi session jsonl) — logs reads this instead of captured stdout" })),
-    scope: Type.Optional(Type.String({ description: "list: mine|all|orphans (default all)" })),
+    scope: Type.Optional(Type.String({ description: "list: mine|all|orphans (default mine)" })),
     state: Type.Optional(Type.String({ description: "list: filter by run state" })),
     tail: Type.Optional(Type.Number({ description: "logs: last N lines (default 50, max 200)" })),
   });
@@ -512,7 +672,7 @@ export default function (pi: ExtensionAPI) {
     name: "job",
     label: "Job",
     description:
-      "Persistent cross-platform job scheduler. submit runs any shell command async as a detached process (returns job+run ids immediately, survives parent exit); completion wakes you with exit code + log path — read the log yourself, output is never inlined. NEVER sleep/wait/block for a job — end your turn and the wake will find you. list/get/logs peek without blocking. kill stops (SIGTERM then SIGKILL, log kept). retry launches a fresh run. delete removes job+runs+files. Jobs persist on disk and resume tracking across reboots (dead pids become interrupted and relaunch per restart policy). logFile: if the command writes its own log, pass its path — logs/wakes read it instead of captured stdout (scheduler never writes there). Recipe — pi subagent: submit `pi --session <path>.jsonl -p \"<task>\"` with logFile set to the same path for live structured visibility via logs; continue it later with a new submit reusing the same --session path.",
+      "Persistent cross-platform job scheduler. submit runs any shell command async as a detached process (returns job+run ids immediately, survives parent exit); completion wakes you with exit code + log path — read the log yourself, output is never inlined. NEVER sleep/wait/block for a job — end your turn and the wake will find you. list/get/logs peek without blocking (list defaults to your session; all/orphans opt in). kill stops (SIGTERM then SIGKILL, log kept). retry launches a fresh run. delete removes job+runs+files. Jobs persist across reboots (dead pids become interrupted and relaunch per restart policy). logFile: if the command writes its own log, pass its path — logs/wakes read it instead of captured stdout (scheduler never writes there). Recipe — pi subagent: submit `pi --session <path>.jsonl -p \"<task>\"` with logFile set to the same path for live structured visibility via logs; continue it later with a new submit reusing the same --session path.",
     parameters: JobParams,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const ectx = ctx as ExtensionToolContext;
@@ -534,14 +694,8 @@ export default function (pi: ExtensionAPI) {
             return textResult(`Started **${job.label}** job=${job.id} run=${run.runId}. Logs: ${effLog(run)}. Async — completion wakes you.`, { jobId: job.id, runId: run.runId, logFile: effLog(run) });
           }
           case "list": {
-            const scope = params.scope ?? "all";
             const sess = currentSession(ectx);
-            let jobs = Object.values(reg.jobs);
-            if (scope === "mine") jobs = jobs.filter((j) => j.sessionId && j.sessionId === sess.id);
-            else if (scope === "orphans") jobs = jobs.filter((j) => !j.sessionId || j.sessionId !== sess.id);
-            if (params.state) {
-              jobs = jobs.filter((j) => Object.values(reg.runs).some((r) => r.jobId === j.id && r.state === params.state));
-            }
+            const jobs = listJobs(sess.id, params.scope ?? "mine", params.state);
             if (!jobs.length) return textResult("No jobs.", { count: 0 });
             return textResult(jobs.map(jobSummary).join("\n"), { count: jobs.length, jobs: jobs.map((j) => ({ id: j.id, label: j.label })) });
           }
@@ -549,27 +703,28 @@ export default function (pi: ExtensionAPI) {
             const t = resolve(params.id ?? "");
             if (!t) return errResult(`no such job or run '${params.id ?? ""}'`);
             if (t.kind === "run") {
-              const r = reg.runs[t.runId!]!;
+              const r = getRun(t.runId!);
+              if (!r) return errResult(`no such run '${params.id ?? ""}'`);
               return textResult(runSummary(r), { jobId: r.jobId, runId: r.runId, status: r.state });
             }
-            const j = reg.jobs[t.jobId]!;
-            const runs = Object.values(reg.runs).filter((r) => r.jobId === j.id).sort((a, b) => b.startedAt - a.startedAt);
-            return textResult(`${jobSummary(j)}\ncommand: ${j.command}\ncwd: ${j.cwd}` + (runs.length ? `\n${runs.slice(0, 5).map(runSummary).join("\n")}` : ""), { jobId: j.id });
+            const j = getJob(t.jobId);
+            if (!j) return errResult(`no such job '${params.id ?? ""}'`);
+            const runs = runsOf(j.id, 5);
+            return textResult(`${jobSummary(j)}\ncommand: ${j.command}\ncwd: ${j.cwd}` + (runs.length ? `\n${runs.map(runSummary).join("\n")}` : ""), { jobId: j.id });
           }
           case "logs": {
             const t = resolve(params.id ?? "");
             if (!t) return errResult(`no such job or run '${params.id ?? ""}'`);
-            const runId = t.kind === "run" ? t.runId! : Object.values(reg.runs).filter((r) => r.jobId === t.jobId).sort((a, b) => b.startedAt - a.startedAt)[0]?.runId;
-            if (!runId || !reg.runs[runId]) return errResult(`no runs for '${params.id}' yet`);
-            const run = reg.runs[runId];
+            const run = t.kind === "run" ? getRun(t.runId!) : latestRun(t.jobId);
+            if (!run) return errResult(`no runs for '${params.id}' yet`);
             const tail = Math.min(Math.max(params.tail ?? 50, 1), 200);
-            return textResult(`${runId} (${run.state})\n${readTail(effLog(run), tail)}`, { jobId: run.jobId, runId, status: run.state, logFile: effLog(run) });
+            return textResult(`${run.runId} (${run.state})\n${readTail(effLog(run), tail)}`, { jobId: run.jobId, runId: run.runId, status: run.state, logFile: effLog(run) });
           }
           case "kill": {
             const t = resolve(params.id ?? "");
             if (!t) return errResult(`no such job or run '${params.id ?? ""}'`);
             if (t.kind === "job") {
-              const targets = Object.values(reg.runs).filter((r) => r.jobId === t.jobId && r.state === "running");
+              const targets = runsOf(t.jobId).filter((r) => r.state === "running");
               if (!targets.length) return textResult(`${t.jobId} has no running runs.`, { jobId: t.jobId });
               for (const r of targets) await killRun(pi, r.runId);
               return textResult(`Killed ${targets.length} run(s) of ${t.jobId}. Logs kept.`, { jobId: t.jobId });
@@ -590,13 +745,10 @@ export default function (pi: ExtensionAPI) {
           case "adopt": {
             const t = resolve(params.id ?? "");
             if (!t) return errResult(`no such job or run '${params.id ?? ""}'`);
-            const job = reg.jobs[t.jobId]!;
             const sess = currentSession(ectx);
-            job.sessionId = sess.id;
-            job.sessionFile = sess.file;
-            job.updatedAt = Date.now();
-            save();
-            return textResult(`Adopted ${job.id} into this session.`, { jobId: job.id });
+            db().prepare("UPDATE jobs SET session_id = ?, session_file = ?, updated_at = ? WHERE id = ?")
+              .run(sess.id ?? null, sess.file ?? null, Date.now(), t.jobId);
+            return textResult(`Adopted ${t.jobId} into this session.`, { jobId: t.jobId });
           }
         }
       } catch (e: any) {
@@ -615,13 +767,11 @@ export default function (pi: ExtensionAPI) {
     pi.sendMessage({ customType: "job-note", content, display: true, details });
 
   pi.registerCommand("jobs", {
-    description: "List jobs (scope: /jobs [mine|all|orphans])",
+    description: "List jobs (scope: /jobs [mine|all|orphans], default mine)",
     handler: async (args, ctx) => {
-      const scope = args.trim().split(/\s+/)[0] || "all";
+      const scope = args.trim().split(/\s+/)[0] || "mine";
       const sess = currentSession(ctx as ExtensionContext);
-      let jobs = Object.values(reg.jobs);
-      if (scope === "mine") jobs = jobs.filter((j) => j.sessionId && j.sessionId === sess.id);
-      else if (scope === "orphans") jobs = jobs.filter((j) => !j.sessionId || j.sessionId !== sess.id);
+      const jobs = listJobs(sess.id, scope);
       note(jobs.length ? jobs.map(jobSummary).join("\n") : "No jobs.", { count: jobs.length });
     },
   });
@@ -634,7 +784,7 @@ export default function (pi: ExtensionAPI) {
         const t = resolve(id);
         if (!t) { note(`no such job or run '${id}'`); return; }
         if (t.kind === "job") {
-          for (const r of Object.values(reg.runs).filter((r) => r.jobId === t.jobId && r.state === "running")) await killRun(pi, r.runId);
+          for (const r of runsOf(t.jobId).filter((r) => r.state === "running")) await killRun(pi, r.runId);
           note(`Killed running runs of ${t.jobId}.`);
         } else {
           await killRun(pi, t.runId!);
@@ -651,9 +801,9 @@ export default function (pi: ExtensionAPI) {
       try {
         const t = resolve(id);
         if (!t) { note(`no such job or run '${id}'`); return; }
-        const runId = t.kind === "run" ? t.runId! : Object.values(reg.runs).filter((r) => r.jobId === t.jobId).sort((a, b) => b.startedAt - a.startedAt)[0]?.runId;
-        if (!runId || !reg.runs[runId]) { note(`no runs for '${id}'`); return; }
-        note(`${runId} (${reg.runs[runId].state})\n${readTail(effLog(reg.runs[runId]), Math.min(Number(n) || 50, 200))}`);
+        const run = t.kind === "run" ? getRun(t.runId!) : latestRun(t.jobId);
+        if (!run) { note(`no runs for '${id}'`); return; }
+        note(`${run.runId} (${run.state})\n${readTail(effLog(run), Math.min(Number(n) || 50, 200))}`);
       } catch (e: any) { note(e.message ?? String(e)); }
     },
   });
@@ -682,7 +832,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_ev, ctx) => {
     tuiCtx = ctx;
-    load();
+    db();
     const notes = reconcile(pi);
     startPoller(pi);
     refreshWidget();
@@ -693,9 +843,9 @@ export default function (pi: ExtensionAPI) {
     }
   });
   pi.on("session_shutdown", () => {
-    // Jobs SURVIVE shutdown: detached + direct-to-file logs. Just persist + stop polling.
+    // Jobs SURVIVE shutdown: detached + direct-to-file logs, every mutation
+    // is already in SQLite. Nothing to persist; just stop polling.
     stopPoller();
-    save();
     live.clear();
     stopping.clear();
     refreshWidget();
